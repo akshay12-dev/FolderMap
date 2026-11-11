@@ -2,28 +2,34 @@
 """
 Folder -> Text Converter  (interactive desktop app)
 
-Run:  python folder_to_text.py
+Run:  python foldermap.py
 
 Features
   * Pick any folder, scan it, and see every file in a table
   * Tick / untick files, filter by category or name, select all / none / invert
+  * Sort the table by clicking a column heading
   * Live preview of the extracted text for any file you click
   * Output as: one .txt per file, one combined .txt, or one combined Markdown file
   * Options: subfolders, hidden files, max file size, file headers, image placeholder style
   * Progress bar, per-file status, live log, Cancel button, open-output button
   * Skips binaries and junk folders (venv, node_modules, .git, build...) automatically
   * Works with Python, Kotlin, Java, C/C++, HTML, JS and many more with NO extra libraries
-  * Also works from the command line:  python folder_to_text.py <folder> [--combine]
+  * Also works from the command line:  python foldermap.py <folder> [--combine]
+  * Remembers the last folder you used between sessions
 
 Images are never converted; they appear as <name>.img (configurable).
 """
+import argparse
+import codecs
 import html
 import json
 import os
 import queue
+import re
 import subprocess
 import sys
 import threading
+from datetime import datetime
 from html.parser import HTMLParser
 from pathlib import Path
 
@@ -40,7 +46,7 @@ TEXT_EXTS = {
     ".cc", ".cxx", ".hpp", ".hh", ".hxx", ".inl", ".cmake", ".mk", ".makefile",
     # Web / other
     ".jsx", ".tsx", ".vue", ".scss", ".sass", ".less", ".svelte", ".swift", ".dart",
-    ".rs", ".lua", ".pl", ".ps1", ".gitignore", ".env", ".cfg", ".conf", ".rst",
+    ".rs", ".lua", ".pl", ".ps1", ".conf", ".rst",
 }
 
 # Files that are binary: never read, unticked by default, never counted as errors
@@ -57,6 +63,8 @@ JUNK_DIRS = {
     ".gradle", "build", "dist", "target", "out", ".mypy_cache", ".pytest_cache", ".dart_tool",
     "site-packages", ".svn", ".hg", "cmake-build-debug", "cmake-build-release", "Pods",
 }
+JUNK_DIRS_LOWER = {d.lower() for d in JUNK_DIRS}
+
 HTML_EXTS = {".html", ".htm"}
 DOC_EXTS = {".pdf", ".docx", ".pptx"}
 SHEET_EXTS = {".xlsx", ".xlsm", ".csv", ".tsv"}
@@ -64,6 +72,10 @@ IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".gif", ".webp",
 
 CATEGORIES = ["All", "Text / Code", "Documents", "Spreadsheets", "Images", "Binary (skipped)", "Other"]
 
+# Safety cap so one giant spreadsheet cannot produce a multi-gigabyte text file
+MAX_SHEET_ROWS = 20000
+
+CONFIG_FILE = Path.home() / ".foldermap.json"
 
 
 def category_of(ext: str) -> str:
@@ -73,7 +85,7 @@ def category_of(ext: str) -> str:
         return "Binary (skipped)"
     if ext in DOC_EXTS:
         return "Documents"
-    if ext in (".xlsx", ".xlsm", ".csv", ".tsv"):
+    if ext in SHEET_EXTS:
         return "Spreadsheets"
     if ext in TEXT_EXTS or ext in HTML_EXTS or ext in (".ipynb", ""):
         return "Text / Code"
@@ -81,10 +93,18 @@ def category_of(ext: str) -> str:
 
 
 def human(n: int) -> str:
-    for unit in ("B", "KB", "MB", "GB"):
-        if n < 1024 or unit == "GB":
+    n = float(n)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024 or unit == "TB":
             return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
         n /= 1024
+    return f"{n:.1f} TB"
+
+
+def _fence_for(text: str) -> str:
+    """Return a Markdown code fence that the text cannot accidentally close."""
+    longest = max((len(m) for m in re.findall(r"`+", text)), default=0)
+    return "`" * max(3, longest + 1)
 
 
 class _HTMLText(HTMLParser):
@@ -111,19 +131,72 @@ class SkipFile(Exception):
     """File is intentionally not converted (binary, needs missing library...)."""
 
 
+def _utf16_encoding(data: bytes):
+    """Guess BOM-less UTF-16 endianness from zero-byte patterns, else None."""
+    sample = data[:4096]
+    if len(sample) < 4 or len(sample) % 2:
+        return None
+    half = len(sample) // 2
+    zero_even = sum(1 for i in range(0, len(sample), 2) if sample[i] == 0)
+    zero_odd = sum(1 for i in range(1, len(sample), 2) if sample[i] == 0)
+    if zero_odd >= half * 0.6:
+        return "utf-16-le"
+    if zero_even >= half * 0.6:
+        return "utf-16-be"
+    return None
+
+
+def _looks_like_text(text: str) -> bool:
+    """Reject decodings dominated by control characters (i.e. actual binary)."""
+    sample = text[:2000]
+    if not sample:
+        return True
+    bad = sum(1 for ch in sample
+              if (ord(ch) < 32 and ch not in "\t\n\r") or 0x7F <= ord(ch) <= 0x9F)
+    return bad <= len(sample) * 0.02
+
+
 def read_plain(p: Path) -> str:
-    for enc in ("utf-8-sig", "utf-16", "cp1252", "latin-1"):
-        try:
-            return p.read_text(encoding=enc)
-        except (UnicodeDecodeError, UnicodeError):
-            continue
-    raise ValueError("unknown text encoding")
+    """Read a text file, preferring UTF-8 and only falling back when needed."""
+    data = p.read_bytes()
+    if not data:
+        return ""
+    if data.startswith((codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE)):
+        return data.decode("utf-16")
+    if data.startswith(codecs.BOM_UTF8):
+        return data.decode("utf-8-sig")
+
+    # NUL bytes mean either BOM-less UTF-16 or a real binary file. Never let
+    # arbitrary even-length bytes be decoded as UTF-16: that silently produces
+    # garbage and used to break legacy (cp1252) files.
+    if b"\x00" in data[:2048]:
+        utf16 = _utf16_encoding(data)
+        if utf16:
+            try:
+                text = data.decode(utf16)
+            except UnicodeDecodeError:
+                text = None
+            if text is not None and _looks_like_text(text):
+                return text
+        raise SkipFile("binary")
+
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        pass
+    try:
+        return data.decode("cp1252")
+    except UnicodeDecodeError:
+        return data.decode("latin-1")
 
 
 def read_pdf(p):
     from pypdf import PdfReader
-    r = PdfReader(str(p))
-    return "\n\n".join(f"--- Page {i} ---\n{pg.extract_text() or ''}" for i, pg in enumerate(r.pages, 1))
+    reader = PdfReader(str(p))
+    if reader.is_encrypted:
+        raise SkipFile("encrypted PDF")
+    return "\n\n".join(f"--- Page {i} ---\n{pg.extract_text() or ''}"
+                       for i, pg in enumerate(reader.pages, 1))
 
 
 def read_docx(p):
@@ -140,10 +213,16 @@ def read_xlsx(p):
     from openpyxl import load_workbook
     wb = load_workbook(str(p), read_only=True, data_only=True)
     out = []
-    for ws in wb.worksheets:
-        out.append(f"## Sheet: {ws.title}")
-        for row in ws.iter_rows(values_only=True):
-            out.append("\t".join("" if v is None else str(v) for v in row))
+    try:
+        for ws in wb.worksheets:
+            out.append(f"## Sheet: {ws.title}")
+            for n, row in enumerate(ws.iter_rows(values_only=True), 1):
+                if n > MAX_SHEET_ROWS:
+                    out.append(f"… (truncated after {MAX_SHEET_ROWS} rows)")
+                    break
+                out.append("\t".join("" if v is None else str(v) for v in row))
+    finally:
+        wb.close()
     return "\n".join(out)
 
 
@@ -153,8 +232,16 @@ def read_pptx(p):
     for i, slide in enumerate(Presentation(str(p)).slides, 1):
         out.append(f"## Slide {i}")
         for sh in slide.shapes:
-            if sh.has_text_frame:
+            if sh.has_text_frame and sh.text_frame.text.strip():
                 out.append(sh.text_frame.text)
+            if getattr(sh, "has_table", False):
+                for row in sh.table.rows:
+                    out.append("\t".join(c.text for c in row.cells))
+        if slide.has_notes_slide:
+            frame = slide.notes_slide.notes_text_frame
+            notes = frame.text if frame is not None else ""
+            if notes.strip():
+                out.append(f"[Notes] {notes}")
     return "\n".join(out)
 
 
@@ -183,19 +270,23 @@ def extract(p: Path, image_mode: str = "stem") -> "str | None":
             return None
         return f"{p.stem}.img" if image_mode == "stem" else f"[IMAGE: {p.name}]"
     if ext in (".pdf", ".docx", ".xlsx", ".xlsm", ".pptx"):
+        reader = {".pdf": read_pdf, ".docx": read_docx, ".xlsx": read_xlsx,
+                  ".xlsm": read_xlsx, ".pptx": read_pptx}[ext]
         try:
-            return {".pdf": read_pdf, ".docx": read_docx, ".xlsx": read_xlsx,
-                    ".xlsm": read_xlsx, ".pptx": read_pptx}[ext](p)
+            return reader(p)
         except ImportError as e:
-            raise SkipFile(f"needs optional library '{e.name}'")
+            raise SkipFile(f"needs optional library '{getattr(e, 'name', None) or '?'}'")
     if ext in HTML_EXTS:
         return read_html(p)
     if ext == ".ipynb":
         return read_ipynb(p)
     if ext in TEXT_EXTS or ext == "":
         return read_plain(p)
-    if b"\x00" in p.read_bytes()[:2048]:
-        raise SkipFile("binary")
+    # Unknown extension: inspect only the first 2 KB instead of loading the
+    # whole file, then let the normal text reader handle it.
+    with p.open("rb") as fh:
+        if b"\x00" in fh.read(2048):
+            raise SkipFile("binary")
     return read_plain(p)
 
 
@@ -207,9 +298,15 @@ def tree_order(rel: Path):
 
 def make_map(src: Path, files, markdown=False) -> str:
     """Folder map (tree with numbers) + summary, to put at the top of the output."""
-    from datetime import datetime
     files = sorted(files, key=lambda f: tree_order(f.relative_to(src)))
     number = {f: i for i, f in enumerate(files, 1)}
+
+    sizes = {}
+    for f in files:
+        try:
+            sizes[f] = f.stat().st_size
+        except OSError:
+            sizes[f] = -1
 
     tree = {}
     for f in files:
@@ -230,25 +327,23 @@ def make_map(src: Path, files, markdown=False) -> str:
                 lines.append(f"{prefix}{branch}{name}/")
                 walk(val, prefix + ("    " if last else "│   "))
             else:
-                try:
-                    size = human(val.stat().st_size)
-                except OSError:
-                    size = "?"
-                lines.append(f"{prefix}{branch}[{number[val]}] {name}  ({size})")
+                size = sizes.get(val, -1)
+                size_text = human(size) if size >= 0 else "?"
+                lines.append(f"{prefix}{branch}[{number[val]}] {name}  ({size_text})")
+
     walk(tree, "")
 
     total = 0
     exts = {}
     for f in files:
-        try:
-            total += f.stat().st_size
-        except OSError:
-            pass
+        size = sizes.get(f, -1)
+        if size > 0:
+            total += size
         e = f.suffix.lower() or "(none)"
         exts[e] = exts.get(e, 0) + 1
+
     ext_line = ", ".join(f"{e}: {n}" for e, n in sorted(exts.items(), key=lambda kv: -kv[1]))
     ndirs = len({f.parent for f in files})
-
     bar = "=" * 70
     summary = [
         f"Source folder : {src}",
@@ -256,11 +351,14 @@ def make_map(src: Path, files, markdown=False) -> str:
         f"Files         : {len(files)} in {ndirs} folder(s), {human(total)} total",
         f"File types    : {ext_line}",
     ]
+
+    map_text = "\n".join(lines)
     if markdown:
+        fence = _fence_for(map_text)
         return ("# Project: " + src.name + "\n\n" + "\n".join("- " + x for x in summary) +
-                "\n\n## Folder map\n\n```\n" + "\n".join(lines) + "\n```\n\n## File details\n")
+                f"\n\n## Folder map\n\n{fence}\n{map_text}\n{fence}\n\n## File details\n")
     return (f"{bar}\nFOLDER MAP: {src.name}\n{bar}\n" + "\n".join(summary) + "\n\n" +
-            "\n".join(lines) + f"\n\n{bar}\nFILE DETAILS (numbers match the map above)\n{bar}\n")
+            map_text + f"\n\n{bar}\nFILE DETAILS (numbers match the map above)\n{bar}\n")
 
 
 def scan_folder(root: Path, recursive=True, hidden=False, skip_junk=True):
@@ -268,7 +366,8 @@ def scan_folder(root: Path, recursive=True, hidden=False, skip_junk=True):
     if recursive:
         for dp, dns, fns in os.walk(root):
             dns[:] = [d for d in dns
-                      if (hidden or not d.startswith(".")) and not (skip_junk and d in JUNK_DIRS)]
+                      if (hidden or not d.startswith("."))
+                      and not (skip_junk and d.lower() in JUNK_DIRS_LOWER)]
             for fn in fns:
                 if hidden or not fn.startswith("."):
                     files.append(Path(dp) / fn)
@@ -277,10 +376,33 @@ def scan_folder(root: Path, recursive=True, hidden=False, skip_junk=True):
     return sorted(files, key=lambda f: str(f).lower())
 
 
+def load_config() -> dict:
+    try:
+        data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_config(data: dict) -> None:
+    try:
+        CONFIG_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    except OSError:
+        pass
+
+
 # --------------------------------------------------------------------------- #
 #  GUI
 # --------------------------------------------------------------------------- #
 def run_gui():
+    if sys.platform.startswith("win"):
+        # Crisp text on high-DPI displays instead of a blurry scaled window.
+        try:
+            import ctypes
+            ctypes.windll.shcore.SetProcessDpiAwareness(1)
+        except Exception:
+            pass
+
     import tkinter as tk
     from tkinter import filedialog, messagebox, ttk
 
@@ -294,19 +416,22 @@ def run_gui():
         pass
 
     q: "queue.Queue" = queue.Queue()
-    state = {"files": [], "checked": {}, "src": None, "cancel": False, "busy": False,
-             "last_out": None, "iids": {}}
+    state = {
+        "files": [], "checked": {}, "src": None, "cancel": False, "busy": False,
+        "last_out": None, "iids": {}, "file_index": {}, "sizes": {}, "status": {},
+        "sort": ("name", False), "scan_gen": 0, "preview_gen": 0,
+    }
 
     # ---- variables
-    v_folder = tk.StringVar()
-    v_out = tk.StringVar()
+    cfg = load_config()
+    v_folder = tk.StringVar(value=cfg.get("folder", ""))
+    v_out = tk.StringVar(value=cfg.get("output", ""))
     v_mode = tk.StringVar(value="separate")
     v_recursive = tk.BooleanVar(value=True)
     v_hidden = tk.BooleanVar(value=False)
     v_headers = tk.BooleanVar(value=True)
     v_junk = tk.BooleanVar(value=True)
     v_map = tk.BooleanVar(value=True)
-    v_image = tk.StringVar(value="stem")
     v_maxmb = tk.StringVar(value="50")
     v_cat = tk.StringVar(value="All")
     v_search = tk.StringVar()
@@ -318,8 +443,10 @@ def run_gui():
     top.pack(fill="x")
     ttk.Label(top, text="Folder:").grid(row=0, column=0, sticky="w")
     ttk.Entry(top, textvariable=v_folder).grid(row=0, column=1, sticky="ew", padx=6)
-    ttk.Button(top, text="Browse…", command=lambda: browse_folder()).grid(row=0, column=2)
-    ttk.Button(top, text="Scan", command=lambda: start_scan()).grid(row=0, column=3, padx=(6, 0))
+    btn_browse = ttk.Button(top, text="Browse…", command=lambda: browse_folder())
+    btn_browse.grid(row=0, column=2)
+    btn_scan = ttk.Button(top, text="Scan", command=lambda: start_scan())
+    btn_scan.grid(row=0, column=3, padx=(6, 0))
     ttk.Label(top, text="Save to:").grid(row=1, column=0, sticky="w", pady=(6, 0))
     ttk.Entry(top, textvariable=v_out).grid(row=1, column=1, sticky="ew", padx=6, pady=(6, 0))
     ttk.Button(top, text="Browse…", command=lambda: browse_out()).grid(row=1, column=2, pady=(6, 0))
@@ -346,7 +473,8 @@ def run_gui():
     img_box.current(0)
     img_box.grid(row=2, column=1, columnspan=2, sticky="w", pady=(6, 0), padx=6)
     ttk.Label(opts, text="Skip files over (MB, 0 = no limit):").grid(row=2, column=3, sticky="e", pady=(6, 0))
-    ttk.Spinbox(opts, from_=0, to=5000, width=6, textvariable=v_maxmb).grid(row=2, column=4, sticky="w", pady=(6, 0), padx=6)
+    ttk.Spinbox(opts, from_=0, to=5000, width=6, textvariable=v_maxmb).grid(
+        row=2, column=4, sticky="w", pady=(6, 0), padx=6)
 
     bar = ttk.Frame(root, padding=(8, 8, 8, 0))
     bar.pack(fill="x")
@@ -355,9 +483,9 @@ def run_gui():
     cat_box.pack(side="left", padx=6)
     ttk.Label(bar, text="Search:").pack(side="left", padx=(8, 0))
     ttk.Entry(bar, textvariable=v_search, width=24).pack(side="left", padx=6)
-    ttk.Button(bar, text="Select all", command=lambda: set_checked("all")).pack(side="left", padx=(12, 2))
-    ttk.Button(bar, text="Select none", command=lambda: set_checked("none")).pack(side="left", padx=2)
-    ttk.Button(bar, text="Invert", command=lambda: set_checked("invert")).pack(side="left", padx=2)
+    ttk.Button(bar, text="Select shown", command=lambda: set_checked("all")).pack(side="left", padx=(12, 2))
+    ttk.Button(bar, text="Clear shown", command=lambda: set_checked("none")).pack(side="left", padx=2)
+    ttk.Button(bar, text="Invert shown", command=lambda: set_checked("invert")).pack(side="left", padx=2)
     ttk.Label(bar, textvariable=v_count).pack(side="right")
 
     paned = ttk.PanedWindow(root, orient="horizontal")
@@ -369,6 +497,8 @@ def run_gui():
     for c, t, w, a in [("sel", "✔", 34, "center"), ("name", "File", 330, "w"),
                        ("type", "Type", 70, "w"), ("size", "Size", 70, "e"), ("status", "Status", 120, "w")]:
         tree.heading(c, text=t)
+        if c != "sel":
+            tree.heading(c, command=lambda c=c: sort_by(c))
         tree.column(c, width=w, anchor=a, stretch=(c == "name"))
     ys = ttk.Scrollbar(left, orient="vertical", command=tree.yview)
     tree.configure(yscrollcommand=ys.set)
@@ -397,7 +527,7 @@ def run_gui():
     ttk.Label(foot, textvariable=v_status).pack(side="left")
     btn_open = ttk.Button(foot, text="Open output", state="disabled", command=lambda: open_output())
     btn_open.pack(side="right")
-    btn_cancel = ttk.Button(foot, text="Cancel", state="disabled", command=lambda: state.update(cancel=True))
+    btn_cancel = ttk.Button(foot, text="Cancel", state="disabled", command=lambda: cancel_convert())
     btn_cancel.pack(side="right", padx=6)
     btn_go = ttk.Button(foot, text="Convert selected ▶", command=lambda: start_convert())
     btn_go.pack(side="right")
@@ -420,9 +550,17 @@ def run_gui():
 
     def max_bytes():
         try:
-            return int(float(v_maxmb.get()) * 1024 * 1024)
+            return max(0, int(float(v_maxmb.get()) * 1024 * 1024))
         except ValueError:
             return 0
+
+    def file_size(f):
+        if f not in state["sizes"]:
+            try:
+                state["sizes"][f] = f.stat().st_size
+            except OSError:
+                state["sizes"][f] = -1
+        return state["sizes"][f]
 
     def browse_folder():
         d = filedialog.askdirectory(title="Select the folder to convert")
@@ -450,24 +588,41 @@ def run_gui():
 
     def refresh_count():
         n = sum(1 for f in state["files"] if state["checked"].get(f))
-        v_count.set(f"{n} of {len(state['files'])} files selected")
+        v_count.set(f"{n} of {len(state['files'])} selected · {len(visible_files())} shown")
+
+    def sort_by(col):
+        cur_col, cur_rev = state.get("sort", ("name", False))
+        state["sort"] = (col, not cur_rev if col == cur_col else False)
+        refresh_tree()
 
     def refresh_tree(*_):
         tree.delete(*tree.get_children())
         state["iids"] = {}
         if not state["src"]:
+            refresh_count()
             return
-        for i, f in enumerate(visible_files()):
-            iid = str(i)
+        files = visible_files()
+        col, reverse = state.get("sort", ("name", False))
+        key = {
+            "name": lambda f: str(f.relative_to(state["src"])).lower(),
+            "type": lambda f: (f.suffix.lower(), str(f.relative_to(state["src"])).lower()),
+            "size": lambda f: file_size(f),
+            "status": lambda f: state["status"].get(f, "").lower(),
+        }.get(col)
+        if key is not None:
+            files.sort(key=key, reverse=reverse)
+
+        for f in files:
+            idx = state["file_index"].get(f)
+            iid = f"f{idx}" if idx is not None else f"x{id(f)}"
             state["iids"][iid] = f
-            ext = f.suffix.lower()
-            try:
-                size = human(f.stat().st_size)
-            except OSError:
-                size = "?"
+            size = file_size(f)
             tree.insert("", "end", iid=iid, values=(
                 "☑" if state["checked"].get(f) else "☐",
-                str(f.relative_to(state["src"])), ext or "—", size, ""))
+                str(f.relative_to(state["src"])),
+                f.suffix.lower() or "—",
+                human(size) if size >= 0 else "?",
+                state["status"].get(f, "")))
         refresh_count()
 
     def set_checked(how):
@@ -494,29 +649,44 @@ def run_gui():
         f = state["iids"].get(sel[0])
         if f is None:
             return
-        set_preview("Loading preview…")
+        state["preview_gen"] += 1
+        gen = state["preview_gen"]
         mode = image_mode()
+        limit = max_bytes()
+        too_big = bool(limit and file_size(f) > limit)
+        set_preview("Loading preview…")
 
         def work():
             try:
-                t = extract(f, "stem" if mode == "skip" else mode)
-                t = t if t is not None else ""
+                if too_big:
+                    q.put(("preview", gen, f"File is larger than the preview limit ({human(limit)})."))
+                    return
+                t = extract(f, mode)
+                t = "" if t is None else t
                 if len(t) > 6000:
                     t = t[:6000] + "\n\n… (preview truncated)"
-                q.put(("preview", t or "(no text found)"))
+                q.put(("preview", gen, t or "(no text found)"))
             except SkipFile as e:
-                q.put(("preview", f"(Not converted: {e})"))
+                q.put(("preview", gen, f"(Not converted: {e})"))
             except Exception as e:
-                q.put(("preview", f"Cannot read this file:\n{e}"))
+                q.put(("preview", gen, f"Cannot read this file:\n{e}"))
         threading.Thread(target=work, daemon=True).start()
 
     def set_busy(b):
         state["busy"] = b
         btn_go.configure(state="disabled" if b else "normal")
+        btn_scan.configure(state="disabled" if b else "normal")
+        btn_browse.configure(state="disabled" if b else "normal")
         btn_cancel.configure(state="normal" if b else "disabled")
+
+    def cancel_convert():
+        state["cancel"] = True
+        v_status.set("Cancelling…")
 
     # ---- scan
     def start_scan():
+        if state["busy"]:
+            return
         d = v_folder.get().strip()
         if not d or not Path(d).is_dir():
             messagebox.showwarning("Folder", "Please choose a valid folder first.")
@@ -527,87 +697,114 @@ def run_gui():
         v_status.set("Scanning…")
         src = Path(d).resolve()
         recursive_, hidden_, junk_ = v_recursive.get(), v_hidden.get(), v_junk.get()
+        state["scan_gen"] += 1
+        gen = state["scan_gen"]
 
         def work():
-            files = scan_folder(src, recursive_, hidden_, junk_)
-            q.put(("scan_done", src, files))
+            try:
+                files = scan_folder(src, recursive_, hidden_, junk_)
+                q.put(("scan_done", gen, src, files))
+            except Exception as e:
+                q.put(("scan_error", gen, str(e)))
         threading.Thread(target=work, daemon=True).start()
 
     # ---- convert
     def start_convert():
-        if state["busy"]:
+        if state["busy"] or state["src"] is None:
             return
         chosen = [f for f in state["files"] if state["checked"].get(f)]
         if not chosen:
-            messagebox.showinfo("Nothing selected", "Tick at least one file (or press Select all).")
+            messagebox.showinfo("Nothing selected", "Tick at least one file (or press Select shown).")
             return
-        out = Path(v_out.get().strip() or (str(state["src"]) + "_text"))
-        mode, headers, imode, limit = v_mode.get(), v_headers.get(), image_mode(), max_bytes()
+        out_raw = v_out.get().strip()
         src = state["src"]
+        out = (Path(out_raw).expanduser().resolve() if out_raw
+               else src.with_name(src.name + "_text"))
+        if out == src:
+            messagebox.showerror("Output folder",
+                                 "Choose an output folder that is not the source folder.")
+            return
+        mode, headers, imode, limit = v_mode.get(), v_headers.get(), image_mode(), max_bytes()
         want_map = v_map.get()
         chosen.sort(key=lambda f: tree_order(f.relative_to(src)))
         numbers = {f: n for n, f in enumerate(chosen, 1)}
+        for f in chosen:
+            state["status"].pop(f, None)
+        refresh_tree()
         state["cancel"] = False
         set_busy(True)
         progress.configure(maximum=len(chosen), value=0)
         btn_open.configure(state="disabled")
         write_log(f"Converting {len(chosen)} file(s) → {out}")
-        rev = {f: iid for iid, f in state["iids"].items()}
+        save_config({"folder": str(src), "output": out_raw})
 
         def work():
             done = skipped = failed = 0
             out_file = None
+            fh = None
             try:
-                if mode == "separate":
-                    out.mkdir(parents=True, exist_ok=True)
-                    target_root = out
-                else:
-                    out.mkdir(parents=True, exist_ok=True)
+                out.mkdir(parents=True, exist_ok=True)
+                if mode == "separate" and want_map:
+                    (out / "_FOLDER_MAP.txt").write_text(make_map(src, chosen), encoding="utf-8")
+                if mode != "separate":
                     out_file = out / (src.name + ("_all.md" if mode == "markdown" else "_all.txt"))
                     fh = open(out_file, "w", encoding="utf-8")
                     if want_map:
                         fh.write(make_map(src, chosen, markdown=(mode == "markdown")))
-                if mode == "separate" and want_map:
-                    (out / "_FOLDER_MAP.txt").write_text(make_map(src, chosen), encoding="utf-8")
                 for i, f in enumerate(chosen, 1):
                     if state["cancel"]:
                         q.put(("log", "Cancelled by user."))
                         break
-                    iid = rev.get(f)
                     rel = f.relative_to(src)
                     try:
                         if out in f.parents:
-                            q.put(("row", iid, "skipped (output)", i)); skipped += 1; continue
+                            q.put(("row", f, "skipped (output)", i))
+                            skipped += 1
+                            continue
                         if limit and f.stat().st_size > limit:
-                            q.put(("row", iid, "too large", i)); skipped += 1
-                            q.put(("log", f"Skipped (too large): {rel}")); continue
+                            q.put(("row", f, "too large", i))
+                            skipped += 1
+                            q.put(("log", f"Skipped (too large): {rel}"))
+                            continue
                         text = extract(f, imode)
                         if text is None:
-                            q.put(("row", iid, "skipped", i)); skipped += 1; continue
+                            q.put(("row", f, "skipped", i))
+                            skipped += 1
+                            continue
                         if mode == "separate":
-                            t = target_root / (str(rel) + ".txt")
+                            t = out / (str(rel) + ".txt")
                             t.parent.mkdir(parents=True, exist_ok=True)
                             t.write_text(text, encoding="utf-8")
                         elif mode == "markdown":
-                            fh.write(f"\n\n### [{numbers[f]}] {rel}\n\n```\n{text}\n```\n" if headers else f"\n{text}\n")
+                            if headers:
+                                fence = _fence_for(text)
+                                fh.write(f"\n\n### [{numbers[f]}] {rel}\n\n{fence}\n{text}\n{fence}\n")
+                            else:
+                                fh.write(f"\n{text}\n")
                         else:
-                            fh.write((f"\n{'-' * 70}\n[{numbers[f]}] FILE: {rel}\n{'-' * 70}\n" if headers else "\n") + text + "\n")
+                            fh.write((f"\n{'-' * 70}\n[{numbers[f]}] FILE: {rel}\n{'-' * 70}\n"
+                                      if headers else "\n") + text + "\n")
                         done += 1
-                        q.put(("row", iid, "✔ done", i))
+                        q.put(("row", f, "✔ done", i))
                     except SkipFile as e:
                         skipped += 1
-                        q.put(("row", iid, "skipped (" + str(e).split(" ")[0] + ")", i))
-                        if "library" in str(e):
-                            q.put(("log", f"Skipped {rel}: {e}"))
+                        msg = str(e)
+                        q.put(("row", f, f"skipped ({msg})", i))
+                        if "library" in msg:
+                            q.put(("log", f"Skipped {rel}: {msg}"))
                     except Exception as e:
                         failed += 1
-                        q.put(("row", iid, "failed", i))
+                        q.put(("row", f, "failed", i))
                         q.put(("log", f"Failed: {rel} ({e})"))
-                if mode != "separate":
-                    fh.close()
             except Exception as e:
                 q.put(("log", f"Error: {e}"))
-            q.put(("done", done, skipped, failed, out_file or out))
+            finally:
+                if fh is not None:
+                    try:
+                        fh.close()
+                    except OSError:
+                        pass
+            q.put(("done", done, skipped, failed, out_file or out, state["cancel"]))
         threading.Thread(target=work, daemon=True).start()
 
     def open_output():
@@ -633,18 +830,45 @@ def run_gui():
                 m = q.get_nowait()
                 k = m[0]
                 if k == "scan_done":
-                    state["src"], state["files"] = m[1], m[2]
-                    state["checked"] = {f: f.suffix.lower() not in BINARY_EXTS for f in m[2]}
+                    gen, src, files = m[1], m[2], m[3]
+                    if gen != state["scan_gen"]:
+                        continue
+                    # Never list the output folder we are about to write into.
+                    out_raw = v_out.get().strip()
+                    if out_raw:
+                        try:
+                            out_guess = Path(out_raw).expanduser().resolve()
+                            files = [f for f in files
+                                     if f != out_guess and out_guess not in f.parents]
+                        except OSError:
+                            pass
+                    state["src"], state["files"] = src, files
+                    state["file_index"] = {f: i for i, f in enumerate(files)}
+                    state["sizes"] = {}
+                    state["status"] = {}
+                    state["checked"] = {f: f.suffix.lower() not in BINARY_EXTS for f in files}
+                    state["sort"] = ("name", False)
                     refresh_tree()
-                    v_status.set(f"Found {len(m[2])} file(s). Untick what you don't want, then Convert.")
-                    write_log(f"Scanned {m[1]} — {len(m[2])} file(s)")
+                    v_status.set(f"Found {len(files)} file(s). Untick what you don't want, then Convert.")
+                    write_log(f"Scanned {src} — {len(files)} file(s)")
+                    save_config({"folder": str(src), "output": out_raw})
+                elif k == "scan_error":
+                    if m[1] == state["scan_gen"]:
+                        v_status.set("Scan failed.")
+                        write_log(f"Scan failed: {m[2]}")
+                        messagebox.showerror("Scan", m[2])
                 elif k == "preview":
-                    set_preview(m[1])
+                    if m[1] == state["preview_gen"]:
+                        set_preview(m[2])
                 elif k == "row":
-                    if m[1] and tree.exists(m[1]):
-                        tree.set(m[1], "status", m[2])
-                    progress.configure(value=m[3])
-                    v_status.set(f"Processed {m[3]} / {int(progress['maximum'])}")
+                    f, text, i = m[1], m[2], m[3]
+                    state["status"][f] = text
+                    idx = state["file_index"].get(f)
+                    iid = f"f{idx}" if idx is not None else None
+                    if iid is not None and tree.exists(iid):
+                        tree.set(iid, "status", text)
+                    progress.configure(value=i)
+                    v_status.set(f"Processed {i} / {int(progress['maximum'])}")
                 elif k == "log":
                     write_log(m[1])
                 elif k == "status":
@@ -653,19 +877,38 @@ def run_gui():
                     set_busy(False)
                     state["last_out"] = m[4]
                     btn_open.configure(state="normal")
-                    v_status.set(f"Finished: {m[1]} converted, {m[2]} skipped, {m[3]} failed.")
-                    write_log(f"Finished → {m[4]}")
+                    cancelled = len(m) > 5 and m[5]
+                    prefix = "Cancelled" if cancelled else "Finished"
+                    v_status.set(f"{prefix}: {m[1]} converted, {m[2]} skipped, {m[3]} failed.")
+                    write_log(f"{prefix} → {m[4]}")
                     if m[3]:
                         messagebox.showwarning("Done with errors", f"{m[3]} file(s) failed. See the log.")
         except queue.Empty:
             pass
         root.after(80, pump)
 
+    def on_search_change(*_):
+        job = state.get("search_job")
+        if job is not None:
+            try:
+                root.after_cancel(job)
+            except tk.TclError:
+                pass
+        state["search_job"] = root.after(250, refresh_tree)
+
+    def on_close():
+        if state["busy"] and not messagebox.askyesno(
+                "Quit", "A conversion is still running. Quit anyway?"):
+            return
+        save_config({"folder": v_folder.get().strip(), "output": v_out.get().strip()})
+        root.destroy()
+
     tree.bind("<Button-1>", on_click)
     tree.bind("<<TreeviewSelect>>", on_select)
     tree.bind("<space>", lambda e: [toggle(i) for i in tree.selection()])
     cat_box.bind("<<ComboboxSelected>>", refresh_tree)
-    v_search.trace_add("write", refresh_tree)
+    v_search.trace_add("write", on_search_change)
+    root.protocol("WM_DELETE_WINDOW", on_close)
 
     pump()
     root.mainloop()
@@ -674,65 +917,145 @@ def run_gui():
 # --------------------------------------------------------------------------- #
 #  Command-line fallback
 # --------------------------------------------------------------------------- #
-def run_cli(folder: Path, combine: bool, output: "Path | None"):
-    src = folder.resolve()
+def run_cli(folder: Path, combine: bool = False, output: "Path | None" = None,
+            markdown: bool = False, want_map: bool = True, hidden: bool = False,
+            skip_junk: bool = True, max_mb: float = 0.0, image_mode: str = "stem",
+            headers: bool = True) -> None:
+    src = folder.expanduser().resolve()
     if not src.is_dir():
         sys.exit(f"Not a folder: {src}")
-    files = [f for f in scan_folder(src) if f.suffix.lower() not in BINARY_EXTS]
-    files.sort(key=lambda f: tree_order(f.relative_to(src)))
-    numbers = {f: n for n, f in enumerate(files, 1)}
-    done, bad = 0, []
+
+    output = output.expanduser().resolve() if output is not None else None
+    limit = int(max_mb * 1024 * 1024) if max_mb and max_mb > 0 else 0
+
+    files = [f for f in scan_folder(src, hidden=hidden, skip_junk=skip_junk)
+             if f.suffix.lower() not in BINARY_EXTS]
+
+    done = skipped = 0
+    bad = []
+
     if combine:
-        out_file = (output or src.with_name(src.name + "_all.txt")).resolve()
-        with open(out_file, "w", encoding="utf-8") as fh:
-            fh.write(make_map(src, files))
+        suffix = "_all.md" if markdown else "_all.txt"
+        if output is not None and output.is_dir():
+            out_file = output / (src.name + suffix)
+        else:
+            out_file = output or src.with_name(src.name + suffix)
+        # Never let a previous run's combined file appear in the map/content.
+        files = [f for f in files if f != out_file]
+        files.sort(key=lambda f: tree_order(f.relative_to(src)))
+        numbers = {f: n for n, f in enumerate(files, 1)}
+        try:
+            out_file.parent.mkdir(parents=True, exist_ok=True)
+            fh = open(out_file, "w", encoding="utf-8")
+        except OSError as e:
+            sys.exit(f"Cannot create output file {out_file}: {e}")
+
+        with fh:
+            if want_map:
+                fh.write(make_map(src, files, markdown=markdown))
             for f in files:
-                if f == out_file:
+                if limit and f.stat().st_size > limit:
+                    skipped += 1
                     continue
                 try:
-                    t = extract(f)
+                    t = extract(f, image_mode)
                     if t is None:
+                        skipped += 1
                         continue
                 except SkipFile:
+                    skipped += 1
                     continue
                 except Exception as e:
-                    bad.append((f, e)); continue
-                fh.write(f"\n{'-' * 70}\n[{numbers[f]}] FILE: {f.relative_to(src)}\n{'-' * 70}\n{t}\n")
+                    bad.append((f, e))
+                    continue
+                rel = f.relative_to(src)
+                if markdown:
+                    if headers:
+                        fence = _fence_for(t)
+                        fh.write(f"\n\n### [{numbers[f]}] {rel}\n\n{fence}\n{t}\n{fence}\n")
+                    else:
+                        fh.write(f"\n{t}\n")
+                else:
+                    fh.write(f"\n{'-' * 70}\n[{numbers[f]}] FILE: {rel}\n{'-' * 70}\n{t}\n")
                 done += 1
         print("Saved:", out_file)
     else:
-        out_dir = (output or src.with_name(src.name + "_text")).resolve()
-        out_dir.mkdir(parents=True, exist_ok=True)
-        (out_dir / "_FOLDER_MAP.txt").write_text(make_map(src, files), encoding="utf-8")
+        out_dir = output or src.with_name(src.name + "_text")
+        if out_dir.exists() and not out_dir.is_dir():
+            sys.exit(f"Output path is a file, not a folder: {out_dir}")
+        # Never list files from the output folder in its own map or output.
+        files = [f for f in files if out_dir not in f.parents]
+        files.sort(key=lambda f: tree_order(f.relative_to(src)))
+        try:
+            out_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            sys.exit(f"Cannot create output folder {out_dir}: {e}")
+        if want_map:
+            (out_dir / "_FOLDER_MAP.txt").write_text(make_map(src, files), encoding="utf-8")
         for f in files:
-            if out_dir in f.parents:
+            if limit and f.stat().st_size > limit:
+                skipped += 1
                 continue
             try:
-                t = extract(f)
+                t = extract(f, image_mode)
                 if t is None:
+                    skipped += 1
                     continue
             except SkipFile:
+                skipped += 1
                 continue
             except Exception as e:
-                bad.append((f, e)); continue
+                bad.append((f, e))
+                continue
             tgt = out_dir / (str(f.relative_to(src)) + ".txt")
             tgt.parent.mkdir(parents=True, exist_ok=True)
-            tgt.write_text(t, encoding="utf-8")
+            try:
+                tgt.write_text(t, encoding="utf-8")
+            except OSError as e:
+                bad.append((f, e))
+                continue
             done += 1
         print("Saved in:", out_dir)
-    print(f"Converted {done}, errors {len(bad)}.")
+
+    print(f"Converted {done}, skipped {skipped}, errors {len(bad)}.")
     for f, e in bad:
-        print(f"  skipped {f.relative_to(src)}: {e}")
+        print(f"  failed {f.relative_to(src)}: {e}")
+
+
+def main(argv=None) -> None:
+    argv = sys.argv[1:] if argv is None else argv
+    if not argv:
+        run_gui()
+        return
+
+    ap = argparse.ArgumentParser(
+        description="Convert a folder's text/code files into .txt or .md output.")
+    ap.add_argument("folder", type=Path, help="folder to scan")
+    ap.add_argument("--combine", action="store_true",
+                    help="write one combined file instead of one .txt per file")
+    ap.add_argument("-o", "--output", type=Path,
+                    help="output file (with --combine) or output folder")
+    ap.add_argument("--markdown", action="store_true",
+                    help="with --combine, write Markdown instead of plain text")
+    ap.add_argument("--no-map", dest="map", action="store_false",
+                    help="do not prepend the folder map")
+    ap.add_argument("--hidden", action="store_true",
+                    help="include hidden files and folders")
+    ap.add_argument("--no-junk-skip", dest="junk", action="store_false",
+                    help="do not skip generated folders such as venv/node_modules")
+    ap.add_argument("--max-mb", type=float, default=0.0,
+                    help="skip files larger than this many MB (0 = no limit)")
+    ap.add_argument("--images", choices=("stem", "full", "skip"), default="stem",
+                    help="how to represent image files")
+    ap.add_argument("--no-headers", dest="headers", action="store_false",
+                    help="omit per-file headers in combined output")
+    a = ap.parse_args(argv)
+
+    run_cli(a.folder, combine=a.combine or a.markdown, output=a.output,
+            markdown=a.markdown, want_map=a.map, hidden=a.hidden,
+            skip_junk=a.junk, max_mb=a.max_mb, image_mode=a.images,
+            headers=a.headers)
 
 
 if __name__ == "__main__":
-    if len(sys.argv) > 1:
-        import argparse
-        ap = argparse.ArgumentParser()
-        ap.add_argument("folder", type=Path)
-        ap.add_argument("--combine", action="store_true")
-        ap.add_argument("-o", "--output", type=Path)
-        a = ap.parse_args()
-        run_cli(a.folder, a.combine, a.output)
-    else:
-        run_gui()
+    main()
