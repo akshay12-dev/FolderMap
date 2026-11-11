@@ -2,42 +2,41 @@
 
 ### Folder → Text Converter & Project Mapper
 
-**FolderMap** is a Python-based desktop application that scans a folder, displays its structure, allows you to select files, and converts their contents into readable text files.
+**FolderMap** is a Python desktop application that scans a folder, displays its structure, lets you choose files, and converts their contents into readable text. It ships with both a Tkinter GUI and a command-line interface.
 
-It is useful for **project documentation, code review, file analysis, backup, sharing project context, and preparing folders for AI/LLM analysis**.
+It is useful for **project documentation, code review, file analysis, backups, sharing project context, and preparing folders for AI/LLM analysis**.
 
 ---
 
 ## ✨ Features
 
 * 📁 Select and scan any folder
-* 🌳 Generate a complete **folder/file map**
-* 🔢 Number files in the generated map
-* ☑️ Select individual files or folders
-* 🔍 Search and filter files
-* 👀 Preview file contents
-* 📄 Convert files into individual `.txt` files
-* 📚 Combine multiple files into a single `.txt`
-* 📝 Generate combined Markdown output
-* 🗂️ Include the folder structure at the beginning of the output
-* 🖼️ Handle image files with configurable placeholders
-* 📊 Display file count, file size and file types
-* 🚫 Skip binary files automatically
-* 🚫 Skip unnecessary folders such as `.git`, `node_modules`, `__pycache__`, etc.
-* 📦 Optional support for PDF, DOCX, XLSX/XLSM and PPTX
-* 📏 Configurable maximum file size
-* ⏳ Progress and status information
-* ❌ Cancel processing
+* 🌳 Generate a complete **folder/file map** with numbered files
+* ☑️ Tick files individually, or select / clear / invert everything that is shown
+* 🔍 Filter by category or name (debounced live search)
+* ↕️ Sort the table by clicking a column heading
+* 👀 Preview extracted text before converting
+* 📄 Convert to individual `.txt` files, one combined `.txt`, or one combined Markdown file
+* 🗂️ Put the folder map and a summary (file count, size, type breakdown) at the top of the output
+* 🖼️ Configurable image placeholders (`<name>.img`, `[IMAGE: file.ext]`, or skip)
+* 🚫 Skip binary files automatically — by extension and by content sniffing
+* 🚫 Skip generated folders such as `.git`, `node_modules`, `__pycache__`, `build`, `venv`
+* 📦 Optional PDF, DOCX, XLSX/XLSM and PPTX support
+* 📏 Configurable maximum file size (GUI and CLI)
+* ⏳ Progress bar, per-file status, live log, cancel button
 * 📂 Open the generated output folder
-* 🖥️ GUI and command-line support
+* 🧠 Correct encoding detection (UTF-8, UTF-8/UTF-16 BOM, BOM-less UTF-16, cp1252)
+* 💾 Remembers the last folder and output path between sessions
+* 🖥️ High-DPI aware on Windows
+* ⌨️ GUI **and** full command-line support
 
 ---
 
 ## 🖥️ Screenshot
 
-Add your application screenshot here:
+Add a screenshot named `screenshot.png` next to this README:
 
-```text
+```markdown
 ![FolderMap Screenshot](screenshot.png)
 ```
 
@@ -61,25 +60,23 @@ MyProject/
     └── sample.csv
 ```
 
-FolderMap can generate a map similar to:
+FolderMap generates a map similar to:
 
 ```text
-Project: MyProject
-
-Folder map
-├── [1] main.py
-├── [2] requirements.txt
-├── [3] README.md
+MyProject/
 ├── config/
-│   └── [4] settings.json
+│   └── [1] settings.json  (420 B)
+├── data/
+│   └── [2] sample.csv  (2.1 KB)
 ├── src/
-│   ├── [5] app.py
-│   └── [6] utils.py
-└── data/
-    └── [7] sample.csv
+│   ├── [3] app.py  (1.8 KB)
+│   └── [4] utils.py  (940 B)
+├── [5] main.py  (1.2 KB)
+├── [6] requirements.txt  (85 B)
+└── [7] README.md  (3.4 KB)
 ```
 
-The extracted contents can then be saved as individual files or combined into a single document.
+The extracted contents can then be saved as individual files or combined into a single document. Folders are always listed before files, and file numbers match the order used in the combined output.
 
 ---
 
@@ -87,159 +84,71 @@ The extracted contents can then be saved as individual files or combined into a 
 
 ### Text & Code
 
-FolderMap supports many common text and programming file types, including:
-
 ```text
-.txt
-.md
-.csv
-.tsv
-.json
-.xml
-.yaml
-.yml
-.ini
-.cfg
-.log
-.py
-.js
-.ts
-.java
-.c
-.cpp
-.h
-.cs
-.go
-.rb
-.php
-.sh
-.sql
-.css
-.html
-.bat
-.ps1
-.toml
-.r
-.kt
-.kts
-.gradle
-.jsx
-.tsx
-.vue
-.scss
-.sass
-.less
-.svelte
-.swift
-.dart
-.rs
-.lua
-.pl
+.txt  .md   .csv  .tsv  .json .xml  .yaml .yml  .ini  .cfg  .conf
+.log  .rtf  .py   .js   .ts   .java .c    .cpp  .h    .hpp  .cc
+.cxx  .cs   .go   .rb   .php  .sh   .sql  .css  .tex  .bat  .ps1
+.toml .r    .kt   .kts  .gradle .properties .pro .aidl .cmake .mk
+.jsx  .tsx  .vue  .scss .sass .less .svelte .swift .dart .rs   .lua
+.pl   .rst  .html .htm  .ipynb
 ```
 
-It also supports common project/configuration files such as:
+Common project files without an extension are treated as text too, including:
 
 ```text
-.gitignore
-.env
-.conf
-CMakeLists.txt
-Makefile
+.gitignore  .env  Makefile  Dockerfile  CMakeLists.txt  LICENSE
 ```
 
----
+### Optional Documents
 
-## 📚 Optional Document Support
+* PDF (`.pdf`)
+* Word (`.docx`)
+* Excel (`.xlsx`, `.xlsm`)
+* PowerPoint (`.pptx`)
+* Jupyter Notebook (`.ipynb`, handled with the standard library)
 
-FolderMap can extract content from additional document formats when the required Python libraries are installed.
+Install the optional dependencies:
 
-Supported formats include:
+```bash
+pip install -r requirements.txt
+```
 
-* PDF
-* DOCX
-* XLSX
-* XLSM
-* PPTX
-* Jupyter Notebook (`.ipynb`)
-
-Install the optional dependencies with:
+or:
 
 ```bash
 pip install pypdf python-docx openpyxl python-pptx
 ```
 
+Optional libraries are only required for their corresponding formats. If a library is missing, the file is skipped with a clear message instead of failing the run.
+
 ---
 
 ## 🚫 Files That Are Skipped
 
-FolderMap automatically avoids many binary and unnecessary file types, including:
+Binary and archive/media types are never read:
 
 ```text
-.exe
-.dll
-.pyd
-.so
-.dylib
-.o
-.obj
-.class
-.jar
-.apk
-.dex
-.pyc
-.bin
-.dat
-.db
-.sqlite
-.zip
-.gz
-.tar
-.7z
-.rar
-.whl
-.egg
-.mp3
-.mp4
-.wav
-.avi
-.mov
-.mkv
-.iso
-.ttf
-.otf
-.woff
-.woff2
+.exe  .dll  .pyd  .so   .dylib .o    .obj  .a     .lib  .class .jar
+.aar  .apk  .dex  .pyc  .pyo  .bin  .dat  .db    .sqlite .zip .gz
+.tar  .7z   .rar  .whl  .egg  .ttf   .otf  .woff  .woff2 .mp3 .mp4
+.wav  .avi  .mov  .mkv  .iso  .pdb   .ilk  .exp   .res  .keystore
 ```
 
-This prevents unnecessary binary data from being included in the generated text.
+Files with an unknown extension are probed by reading the first 2 KB. If NUL bytes are found and the data does not look like UTF-16 text, the file is treated as binary and skipped.
+
+Images are never converted; they are represented by the configured placeholder (or skipped).
 
 ---
 
 ## 🚫 Folders Skipped
 
-Common generated or unnecessary directories are skipped automatically:
+Common generated or third-party directories are skipped automatically (matching is case-insensitive, so `Build` is skipped as well as `build`):
 
 ```text
-.git
-node_modules
-__pycache__
-venv
-.venv
-env
-.idea
-.vscode
-.gradle
-build
-dist
-target
-out
-.mypy_cache
-.pytest_cache
-.dart_tool
-site-packages
-.svn
-.hg
-Pods
+.git  .hg   .svn  node_modules  __pycache__  venv  .venv  env
+.idea .vscode .gradle  build  dist  target  out
+.mypy_cache  .pytest_cache  .dart_tool  site-packages  Pods
+cmake-build-debug  cmake-build-release
 ```
 
 ---
@@ -249,55 +158,88 @@ Pods
 Run the application:
 
 ```bash
-python folder_to_text.py
+python foldermap.py
 ```
 
-The graphical interface allows you to:
+The interface lets you:
 
 1. Select a source folder
-2. Scan the folder
-3. View the folder structure
-4. Search/filter files
-5. Select the files you want
-6. Preview file contents
-7. Choose an output format
-8. Configure processing options
-9. Start extraction
-10. Open the generated output folder
+2. Scan it and review the tree
+3. Search / filter and sort files
+4. Tick the files you want
+5. Preview extracted text
+6. Choose an output format and options
+7. Convert with live progress and per-file status
+8. Cancel a long run
+9. Open the output folder
+
+The output folder is never listed in its own scan results, and the app refuses to use the source folder as the output folder.
+
+The last used folder and output path are stored in `~/.foldermap.json`.
 
 ---
 
 ## 💻 Command Line
 
-### Scan a folder
-
 ```bash
-python folder_to_text.py "C:\Projects\MyProject"
+python foldermap.py <folder> [options]
 ```
 
-### Combine files into one text file
+### Options
+
+| Option | Description |
+| --- | --- |
+| `--combine` | Write one combined file instead of one `.txt` per file |
+| `--markdown` | With `--combine`, write Markdown instead of plain text (implies `--combine`) |
+| `-o, --output PATH` | Output file (combined mode) or output folder (separate mode) |
+| `--no-map` | Do not prepend the folder map / summary |
+| `--hidden` | Include hidden files and folders |
+| `--no-junk-skip` | Do not skip generated folders such as `venv`, `node_modules`, `build` |
+| `--max-mb N` | Skip files larger than `N` MB (`0` = no limit, default) |
+| `--images {stem,full,skip}` | Image placeholder style (default `stem`) |
+| `--no-headers` | Omit per-file headers in combined output |
+
+### Examples
+
+Scan a folder and write individual `.txt` files:
 
 ```bash
-python folder_to_text.py "C:\Projects\MyProject" --combine
+python foldermap.py "C:\Projects\MyProject"
 ```
 
-### Specify an output directory
+Combine everything into one text file:
 
 ```bash
-python folder_to_text.py "C:\Projects\MyProject" -o "C:\Output"
+python foldermap.py "C:\Projects\MyProject" --combine
 ```
 
-### Show help
+Combine into Markdown, skipping files over 10 MB and omitting image placeholders:
 
 ```bash
-python folder_to_text.py --help
+python foldermap.py "C:\Projects\MyProject" --markdown --max-mb 10 --images skip -o "C:\Output\context.md"
+```
+
+Choose an output directory (a file name is generated inside it):
+
+```bash
+python foldermap.py "C:\Projects\MyProject" --combine -o "C:\Output"
+```
+
+Include hidden files and keep generated folders:
+
+```bash
+python foldermap.py "C:\Projects\MyProject" --hidden --no-junk-skip
+```
+
+Show help:
+
+```bash
+python foldermap.py --help
 ```
 
 ---
 
 ## 📤 Output
-
-Depending on the selected mode, FolderMap can generate:
 
 ### Individual files
 
@@ -325,103 +267,110 @@ MyProject_all.txt
 MyProject_all.md
 ```
 
-The generated combined document can contain the project map followed by the extracted file contents.
+Combined output contains the project map followed by the extracted file contents. In Markdown mode, each file is placed in a fenced code block whose fence is automatically longer than any backtick run inside the file, so content cannot break the document.
 
 ---
 
 ## 🖼️ Image Handling
 
-FolderMap does not attempt to convert image binaries into text.
+FolderMap does not convert image binaries into text. Images can be represented as:
 
-Instead, images can be represented using placeholders such as:
+```text
+example.img
+```
+
+or:
 
 ```text
 [IMAGE: example.png]
 ```
 
-This keeps the generated project documentation lightweight while still showing where images exist.
+or skipped entirely. This keeps the generated project documentation lightweight while still showing where images exist.
 
 ---
 
 ## ⚙️ Configuration
 
-FolderMap provides options for controlling the scanning and extraction process, including:
+GUI options:
 
 * Include subfolders
 * Include hidden files
 * Skip junk folders
-* Generate folder map
+* Generate the folder map
 * Add file headers
 * Maximum file size
 * Image handling mode
-* Output format
-* Separate or combined output
+* Output format (separate `.txt`, combined `.txt`, combined `.md`)
 
-A maximum file size can be configured to prevent very large files from slowing down the extraction process.
+The maximum file size prevents very large files from slowing down extraction. Very large spreadsheets are additionally capped at 20,000 rows per sheet, with a truncation note in the output.
 
 ---
 
 ## 🛠️ Technologies Used
 
-* **Python**
-* **Tkinter** — Desktop GUI
-* **Pathlib** — File and directory handling
-* **argparse** — Command-line interface
-* **pypdf** — PDF extraction
-* **python-docx** — DOCX extraction
-* **openpyxl** — Excel extraction
-* **python-pptx** — PowerPoint extraction
-
-Optional libraries are only required for their corresponding document formats.
+* **Python** (standard library only for the core application)
+* **Tkinter** — desktop GUI
+* **pathlib / os.walk** — file and directory handling
+* **argparse** — command-line interface
+* **pypdf**, **python-docx**, **openpyxl**, **python-pptx** — optional document extraction
 
 ---
 
 ## 📋 Requirements
 
-* Python 3.x
-* Windows / Linux / macOS
-* Tkinter
-* Optional document-processing libraries
-
-Check your Python version:
-
-```bash
-python --version
-```
+* Python 3.8 or newer
+* Windows, Linux, or macOS
+* Tkinter (included with standard Python installers on Windows/macOS; on Linux install `python3-tk`)
+* Optional document libraries listed in `requirements.txt`
 
 ---
 
 ## 🚀 Installation
 
-Clone the repository:
-
 ```bash
-git clone https://github.com/YOUR-USERNAME/FolderMap.git
-```
-
-Open the project folder:
-
-```bash
+git clone <repository-url>
 cd FolderMap
+python foldermap.py
 ```
 
-Run the application:
+For document formats:
 
 ```bash
-python folder_to_text.py
+pip install -r requirements.txt
 ```
 
-For additional document formats:
+There is no build step and no virtual environment required for the core features.
+
+---
+
+## 🧪 Running the Tests
+
+The project uses the standard-library `unittest` module:
 
 ```bash
-pip install pypdf python-docx openpyxl python-pptx
+python -m unittest discover -s tests -v
+```
+
+The suite covers encoding detection, binary sniffing, extension categories, tree/map ordering, Markdown fences, scanning rules, image modes, and CLI output modes.
+
+---
+
+## 📁 Project Structure
+
+```text
+FolderMap/
+├── folder_to_text.py      # Application (GUI + CLI)
+├── README.md
+├── LICENSE
+├── requirements.txt       # Optional document-format libraries
+├── .gitignore
+└── tests/
+    └── test_core.py
 ```
 
 ---
 
 ## 🎯 Use Cases
-
-FolderMap can be useful for:
 
 * 📚 Project documentation
 * 👨‍💻 Code review
@@ -438,49 +387,31 @@ FolderMap can be useful for:
 
 ## 🔮 Future Improvements
 
-Possible future features include:
-
-* Drag-and-drop folders
+* Drag-and-drop folders (requires an optional Tk extension)
 * Dark mode
 * Custom file-extension support
 * ZIP project import/export
-* Project statistics
+* Character / token counter for LLM context budgeting
 * Duplicate file detection
-* Character/token counter
-* Git repository integration
-* `.gitignore` support
+* Git repository integration and `.gitignore`-aware scanning
 * Custom output templates
 * AI-ready context generation
 * Windows `.exe` release
-* More document formats
-
----
-
-## 📁 Project Structure
-
-```text
-FolderMap/
-│
-├── folder_to_text.py
-├── README.md
-└── ...
-```
+* More document formats (`.xls`, `.doc`, `.ppt`, `.odt`)
 
 ---
 
 ## 🤝 Contributing
 
-Contributions, suggestions and improvements are welcome.
+Contributions, suggestions, and improvements are welcome.
 
-If you find a bug or have an idea for a new feature, feel free to open an issue or submit a pull request.
+If you find a bug or have an idea for a new feature, feel free to open an issue or submit a pull request. Please run the test suite before submitting changes.
 
 ---
 
 ## 📜 License
 
-This project is currently available for personal and educational use.
-
-A formal open-source license can be added later.
+This project is released under the [MIT License](LICENSE).
 
 ---
 
