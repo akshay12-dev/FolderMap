@@ -1,0 +1,8 @@
+# FolderMap has no required third-party dependencies; the GUI and all code /
+# text extraction use the Python standard library.
+#
+# These are optional and only needed for the corresponding document formats:
+pypdf>=3.0
+python-docx>=1.0
+openpyxl>=3.1
+python-pptx>=0.6
